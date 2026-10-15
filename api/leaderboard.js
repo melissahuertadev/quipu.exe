@@ -10,7 +10,7 @@ export default async function handler(req, res) {
 
   try {
     const internalName = encodeURIComponent(process.env.TALO_LEADERBOARD_INTERNAL_NAME);
-    const query = new URLSearchParams({ page: '0', withDeleted: 'false' });
+    const query = new URLSearchParams({ page: '0', withDeleted: '0' });
     const data = await taloJson(await taloRequest(`/leaderboards/${internalName}/entries?${query}`));
     const entries = (Array.isArray(data.entries) ? data.entries : [])
       .filter((entry) => !entry.hidden)

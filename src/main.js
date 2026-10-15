@@ -532,7 +532,7 @@ class QuipuScene extends Phaser.Scene {
       const nameY = resultY + (short ? 94 : 112);
       const canEditName = !run.submissionPayload;
       const submittedName = run.submissionPayload?.name || run.name || 'Anónimo';
-      if (!short && canEditName) {
+      if (canEditName) {
         this.text(w / 2, nameY - 23, 'NOMBRE PARA EL RANKING', { fontSize: '10px', color: '#c3c2d2', letterSpacing: 1 }).setOrigin(.5, 0);
         this.addPlayerNameInput(w / 2 - Math.min(135, (w - 48) / 2), nameY, Math.min(270, w - 48));
         this.nameInput.value = run.name === 'Anónimo' ? (this.playerName || '') : run.name;

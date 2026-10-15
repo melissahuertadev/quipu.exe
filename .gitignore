@@ -3,6 +3,7 @@ node_modules/
 
 # Production build
 dist/
+.vercel/
 
 # Local environment and secrets
 .env
