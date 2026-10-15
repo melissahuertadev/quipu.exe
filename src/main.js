@@ -3,7 +3,11 @@ import './style.css';
 import { drawFiberRope, drawMainCord } from './components/quipu-cord.js';
 import { drawMountainBackdrop } from './components/mountain-backdrop.js';
 import { AudioManager } from './audio/audio-manager.js';
-import { clearRanking, PLAYER_NAME_KEY, readRanking, recordCompletedRun } from './ranking.js';
+import {
+  createRunId, getLatestCompletedRun, getPendingRuns, getRun,
+  getStablePlayerId, PLAYER_NAME_KEY, saveCompletedRun, updateRun,
+} from './ranking.js';
+import { fetchGlobalEntries, leaderboardConfigured, submitCompletedRun } from './leaderboard-client.js';
 
 const LEVELS = [
   { title: 'La calma', rule: 'Ordena de menos a más nudos', type: 'nudos', values: [5, 1, 4, 2], colors: [0xd67d62, 0xe2b85f, 0x55aaa0, 0x8792d0], message: 'No todo lo que sentimos necesita una respuesta inmediata. A veces, escucharnos es el primer paso para encontrar calma.' },
@@ -20,6 +24,7 @@ const FINAL_REFLECTION = 'Entre una voz y otra, queda un silencio donde los vín
 const readPlayerName = () => { try { return localStorage.getItem(PLAYER_NAME_KEY) || ''; } catch { return ''; } };
 const savePlayerName = (name) => { try { localStorage.setItem(PLAYER_NAME_KEY, name); } catch { /* The game remains playable when storage is blocked. */ } };
 const formatTime = (milliseconds) => {
+  if (!Number.isFinite(milliseconds)) return '--:--';
   const seconds = Math.floor(milliseconds / 1000);
   return `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`;
 };
@@ -33,23 +38,14 @@ class QuipuScene extends Phaser.Scene {
     this.moves = 0;
     this.totalMoves = 0;
     this.playerName = readPlayerName();
+    this.submittingRuns = new Set();
+    this.rankingState = { status: 'idle', entries: [] };
+    this.completedRunId = null;
     this.orders = LEVELS.map(level => level.values.map((value, id) => ({ value, id, color: level.colors[id] })).reverse());
     this.scale.on('resize', () => this.render());
     this.renderIntro();
   }
   clear() { this.nameInput?.remove(); this.nameInput = null; this.children.removeAll(true); this.input.removeAllListeners(); }
-  captureNameInput() {
-    if (!this.nameInput) return null;
-    return { value: this.nameInput.value, focused: document.activeElement === this.nameInput, selectionStart: this.nameInput.selectionStart, selectionEnd: this.nameInput.selectionEnd };
-  }
-  restoreNameInput(state) {
-    if (!state || !this.nameInput) return;
-    this.nameInput.value = state.value;
-    if (state.focused) {
-      this.nameInput.focus({ preventScroll: true });
-      this.nameInput.setSelectionRange(state.selectionStart, state.selectionEnd);
-    }
-  }
   addPlayerNameInput(x, y, width) {
     const input = document.createElement('input');
     input.className = 'quipu-name-input'; input.type = 'text'; input.maxLength = 18;
@@ -57,7 +53,14 @@ class QuipuScene extends Phaser.Scene {
     input.placeholder = 'Tu nombre para el ranking'; input.value = this.playerName || '';
     Object.assign(input.style, { left: `${x}px`, top: `${y}px`, width: `${width}px` });
     document.getElementById('game').appendChild(input); this.nameInput = input;
-    input.addEventListener('input', () => { this.playerName = input.value.trim().slice(0, 18); savePlayerName(this.playerName); });
+    input.addEventListener('input', () => {
+      this.playerName = input.value.trim().slice(0, 18);
+      savePlayerName(this.playerName);
+      if (this.screen === 'results' && this.completedRunId) {
+        const run = getRun(this.completedRunId);
+        if (!run?.submissionPayload) updateRun(this.completedRunId, { name: this.playerName || 'Anónimo' });
+      }
+    });
   }
   menuLink(x, y, label, callback, originX = 0) {
     const link = this.text(x, y, label, { fontSize: '12px', fontStyle: '500', color: '#c3c2d2', letterSpacing: .4 })
@@ -166,6 +169,7 @@ class QuipuScene extends Phaser.Scene {
     else if (this.screen === 'memory') this.showMemory();
     else if (this.screen === 'about') this.renderAbout();
     else if (this.screen === 'ranking') this.renderRanking();
+    else if (this.screen === 'results') this.renderResults(this.completedRunId);
     else if (this.screen === 'settings') this.renderSettings();
     else this.renderEnd();
   }
@@ -183,13 +187,13 @@ class QuipuScene extends Phaser.Scene {
     this.drawNarrativeQuipu(h * .51, Math.min(w - 80, 470), LEVELS[0].colors);
     this.narrativeButton(h * .72, 'JUGAR  →', () => { audio.unlock(); this.startGame(); }, { revealAfter: 180 });
     this.menuLink(w * .18, h * .85, 'SOBRE EL JUEGO', () => this.renderAbout(), .5);
-    this.menuLink(w * .50, h * .85, 'RANKING', () => this.renderRanking(), .5);
+    this.menuLink(w * .50, h * .85, 'RANKING', () => this.openRanking(), .5);
     this.menuLink(w * .82, h * .85, 'AJUSTES', () => this.renderSettings(), .5);
     this.creditLink(h - 26);
   }
   startGame() {
     this.time.removeAllEvents(); this.levelIndex = 0; this.moves = 0; this.totalMoves = 0;
-    this.runStartedAt = Date.now(); this.runId = `${this.runStartedAt}-${Math.random().toString(36).slice(2)}`; this.rankSavedForRun = false;
+    this.runStartedAt = Date.now(); this.runId = createRunId(); this.rankSavedForRun = false;
     this.orders = LEVELS.map(level => level.values.map((value, id) => ({ value, id, color: level.colors[id] })).reverse()); this.renderLevel();
   }
   renderLevel() {
@@ -310,7 +314,13 @@ class QuipuScene extends Phaser.Scene {
         audio.playEnding();
         if (!this.rankSavedForRun && this.runId && this.runStartedAt) {
           this.rankSavedForRun = true;
-          recordCompletedRun({ runId: this.runId, name: this.playerName || readPlayerName(), elapsedMs: Date.now() - this.runStartedAt, totalMoves: this.totalMoves });
+          const completedRun = saveCompletedRun({
+            runId: this.runId,
+            name: this.playerName || readPlayerName() || 'Anónimo',
+            elapsedMs: Date.now() - this.runStartedAt,
+            totalMoves: this.totalMoves,
+          });
+          this.completedRunId = completedRun?.runId || this.runId;
         }
       }
       else audio.playMemory();
@@ -363,11 +373,6 @@ class QuipuScene extends Phaser.Scene {
       { fontSize: '13px', color: '#b9b8ca', align: 'center', wordWrap: { width: Math.min(w - 64, 560) }, lineSpacing: 6 })
       .setOrigin(.5, 0);
     this.text(w / 2, h * .75, 'Creado para Hack the Andes Challenge', { fontSize: '13px', color: '#c8c6d3' }).setOrigin(.5, 0);
-    const credit = this.text(w / 2, h * .81, 'Made with ♥ by mhdev  ↗', { fontSize: '14px', fontStyle: '500', color: '#e1d3db' })
-      .setOrigin(.5, 0).setInteractive({ useHandCursor: true });
-    credit.on('pointerover', () => credit.setColor('#f0d9b5'));
-    credit.on('pointerout', () => credit.setColor('#e1d3db'));
-    credit.on('pointerdown', () => window.open('https://melissahuerta.dev/', '_blank', 'noopener,noreferrer'));
     this.narrativeButton(h * .91, 'VOLVER AL INICIO', () => this.renderIntro(), { revealAfter: 120 });
   }
   renderSettings() {
@@ -382,53 +387,86 @@ class QuipuScene extends Phaser.Scene {
     this.addAudioControls(Math.max(24, w / 2 - 61), h * .57);
     this.narrativeButton(h * .80, 'VOLVER AL INICIO', () => this.renderIntro(), { revealAfter: 120 });
   }
+  openRanking() {
+    this.rankingState = { status: 'loading', entries: [] };
+    this.renderRanking();
+    this.loadGlobalRanking();
+  }
+  async loadGlobalRanking() {
+    this.rankingState = { status: 'loading', entries: [] };
+    if (this.screen === 'ranking') this.renderRanking();
+    try {
+      const entries = await fetchGlobalEntries();
+      this.rankingState = { status: entries.length ? 'ready' : 'empty', entries };
+    } catch (error) {
+      this.rankingState = {
+        status: leaderboardConfigured ? 'error' : 'unconfigured',
+        message: error.message,
+        entries: [],
+      };
+    }
+    if (this.screen === 'ranking') this.renderRanking();
+  }
   renderRanking() {
-    const nameState = this.captureNameInput();
     this.clear(); this.screen = 'ranking'; this.bg();
     const { width: w, height: h } = this.scale;
     const compact = h < 640;
-    const tight = h < 600;
+    const tight = h < 520;
+    const rowGap = tight ? (h < 470 ? 19 : 22) : compact ? 29 : 34;
+    const rowStart = tight ? 130 : compact ? 184 : 204;
     this.text(28, 26, 'QUIPU', { fontSize: '18px', fontStyle: '500', letterSpacing: 2 });
-    this.text(w / 2, 66, 'Ranking local', { fontSize: '24px', fontStyle: '500' }).setOrigin(.5, 0);
-    this.text(w / 2, 103, 'Puntaje = segundos + 5 × movimientos. Menor es mejor; empate: menor tiempo.', {
+    this.text(w / 2, 66, 'Ranking global', { fontSize: '24px', fontStyle: '500' }).setOrigin(.5, 0);
+    this.text(w / 2, 105, 'Puntaje = segundos + (5 × movimientos). Menor es mejor.', {
       fontSize: '11px', color: '#c3c2d2', align: 'center', wordWrap: { width: w - 56 },
     }).setOrigin(.5, 0);
-    this.text(32, 130, 'TU NOMBRE', { fontSize: '10px', color: HEX(C.muted), letterSpacing: 1 });
-    this.addPlayerNameInput(32, 148, Math.min(270, w - 64));
-    this.restoreNameInput(nameState);
-    const records = readRanking();
-    const rowStart = tight ? 195 : compact ? 203 : 215;
-    const rowGap = tight ? 20 : compact ? 31 : 34;
-    if (!records.length) {
-      this.text(w / 2, rowStart + 12, 'Aún no hay partidas completas.', { fontSize: '14px', color: '#c3c2d2' }).setOrigin(.5, 0);
+    const { status, entries = [] } = this.rankingState || { status: 'idle', entries: [] };
+    if (status === 'loading' || status === 'idle') {
+      this.text(w / 2, rowStart + 12, 'Conectando con el ranking…', { fontSize: '14px', color: '#c3c2d2' }).setOrigin(.5, 0);
+    } else if (status === 'empty') {
+      this.text(w / 2, rowStart + 12, 'Todavía no hay puntuaciones globales.', { fontSize: '14px', color: '#c3c2d2' }).setOrigin(.5, 0);
+    } else if (status === 'unconfigured') {
+      this.text(w / 2, rowStart + 5, 'El ranking global aún no está configurado.', {
+        fontSize: '14px', color: '#d5d3df', align: 'center', wordWrap: { width: w - 64 },
+      }).setOrigin(.5, 0);
+    } else if (status === 'error') {
+      this.text(w / 2, rowStart + 5, 'No pudimos conectar con el ranking.', {
+        fontSize: '14px', color: '#d5d3df', align: 'center', wordWrap: { width: w - 64 },
+      }).setOrigin(.5, 0);
     } else {
-      records.forEach((entry, index) => {
+      entries.slice(0, 10).forEach((entry, index) => {
         const y = rowStart + index * rowGap;
-        const date = new Date(entry.date).toLocaleDateString('es-PE');
+        const compactName = tight ? String(entry.name).slice(0, w < 380 ? 8 : 14) : w < 380 ? String(entry.name).slice(0, 12) : entry.name;
         if (tight) {
-          this.text(32, y, `${String(index + 1).padStart(2, '0')} · ${entry.name} · ${formatTime(entry.elapsedMs)} · ${entry.totalMoves} mov · ${date} · ${entry.score} pts`, {
-            fontSize: w < 360 ? '8px' : '10px', fontStyle: '500', color: '#e5e2e7',
+          this.text(20, y, `${String(index + 1).padStart(2, '0')} · ${compactName} · ${formatTime(entry.elapsedMs)} · ${entry.totalMoves} mov · ${entry.score} pts`, {
+            fontSize: w < 390 ? '8px' : '9px', fontStyle: '500', color: '#e5e2e7',
           });
           return;
         }
-        this.text(32, y, `${String(index + 1).padStart(2, '0')}  ${entry.name}`, {
+        this.text(28, y, `${String(index + 1).padStart(2, '0')}  ${compactName}`, {
           fontSize: compact ? '12px' : '13px', fontStyle: '500', color: '#e5e2e7',
         });
-        this.text(w - 32, y, `${entry.score} pts`, {
+        this.text(w - 28, y, `${Number.isFinite(entry.score) ? entry.score : '—'} pts`, {
           fontSize: compact ? '11px' : '12px', color: '#e2c8aa',
         }).setOrigin(1, 0);
-        this.text(48, y + 15, `${formatTime(entry.elapsedMs)} · ${entry.totalMoves} mov. · ${date}`, {
+        this.text(46, y + 15, `${formatTime(entry.elapsedMs)} · ${entry.totalMoves} mov.`, {
           fontSize: compact ? '9px' : '10px', color: '#aaa9ba',
         });
       });
     }
-    if (this.confirmingRankingClear) {
-      this.text(w / 2, h - 78, '¿BORRAR EL RANKING?', { fontSize: '11px', color: '#c3c2d2' }).setOrigin(.5, 0);
-      this.menuLink(w / 2 - 18, h - 48, 'CANCELAR', () => { this.confirmingRankingClear = false; this.renderRanking(); }, 1);
-      this.menuLink(w / 2 + 18, h - 48, 'BORRAR', () => { clearRanking(); this.confirmingRankingClear = false; this.renderRanking(); });
-    } else {
-      this.menuLink(32, h - 34, 'BORRAR RANKING', () => { this.confirmingRankingClear = true; this.renderRanking(); });
-      this.menuLink(w - 32, h - 34, 'VOLVER', () => this.renderIntro(), 1);
+    const pending = getPendingRuns();
+    const pendingRun = pending.at(-1);
+    if (pendingRun && h > 470) {
+      const pendingY = Math.min(h - 84, rowStart + rowGap * (status === 'ready' ? Math.min(entries.length, 10) : 1) + 8);
+      this.text(w / 2, pendingY, 'Tienes una partida guardada para reintentar.', {
+        fontSize: '11px', color: '#c3c2d2', align: 'center',
+      }).setOrigin(.5, 0);
+      this.menuLink(w / 2, pendingY + 20, 'REINTENTAR ENVÍO', () => this.renderResults(pendingRun.runId), .5);
+    } else if (pendingRun) {
+      this.menuLink(w / 2, h - 62, 'PARTIDA PENDIENTE · REINTENTAR', () => this.renderResults(pendingRun.runId), .5);
+    }
+    this.menuLink(w - 32, h - 34, 'VOLVER', () => this.renderIntro(), 1);
+    if (status === 'error' || status === 'unconfigured') {
+      this.menuLink(32, h - 34, 'REINTENTAR', () => this.loadGlobalRanking());
     }
   }
   showMemory() {
@@ -446,7 +484,7 @@ class QuipuScene extends Phaser.Scene {
       if (reflection.active) this.tweens.add({ targets: reflection, alpha: { from: .91, to: 1 }, duration: 2600, yoyo: true, repeat: -1, ease: 'Sine.InOut' });
     } });
     const isFinalLevel = this.levelIndex === LEVELS.length - 1;
-    this.narrativeButton(h * (compact ? .88 : .84), isFinalLevel ? 'ABRIR EL EPÍLOGO  →' : 'SEGUIR EL HILO  →', () => {
+    this.narrativeButton(h * (compact ? .88 : .84), isFinalLevel ? 'LEER EL EPÍLOGO  →' : 'SEGUIR EL HILO  →', () => {
       if (isFinalLevel) this.renderEnd(); else { this.levelIndex++; this.moves = 0; this.renderLevel(); }
     }, { revealAfter: 720 });
   }
@@ -463,7 +501,90 @@ class QuipuScene extends Phaser.Scene {
     this.tweens.add({ targets: reflection, alpha: .98, y: h * (compact ? .52 : .445), duration: 1300, ease: 'Sine.Out', onComplete: () => {
       if (reflection.active) this.tweens.add({ targets: reflection, alpha: { from: .92, to: 1 }, duration: 3000, yoyo: true, repeat: -1, ease: 'Sine.InOut' });
     } });
-    this.narrativeButton(h * (compact ? .89 : .80), 'VOLVER AL INICIO', () => this.renderIntro(), { revealAfter: 2100 });
+    this.narrativeButton(h * (compact ? .89 : .80), 'VER RESULTADOS  →', () => this.renderResults(this.completedRunId), { revealAfter: 2100 });
+  }
+  renderResults(runId = this.completedRunId) {
+    const run = getRun(runId) || getLatestCompletedRun();
+    if (!run) { this.renderIntro(); return; }
+    this.completedRunId = run.runId;
+    this.clear(); this.screen = 'results'; this.bg();
+    const { width: w, height: h } = this.scale;
+    const compact = h < 600;
+    const short = h < 500;
+    this.text(28, 26, 'QUIPU', { fontSize: '18px', fontStyle: '500', letterSpacing: 2 });
+    this.drawNarrativeQuipu(h * .19, Math.min(w - 56, 500), LEVELS.at(-1).colors);
+    this.text(w / 2, h * .34, 'Tu partida', { fontSize: '23px', fontStyle: '500', color: '#d5d3df' }).setOrigin(.5, 0);
+    const resultY = compact ? h * .36 : h * .43;
+    this.text(w / 2, resultY, `TIEMPO  ${formatTime(run.elapsedMs)}`, { fontSize: compact ? '14px' : '16px', color: '#e5e2e7' }).setOrigin(.5, 0);
+    this.text(w / 2, resultY + 34, `MOVIMIENTOS  ${run.totalMoves}`, { fontSize: compact ? '14px' : '16px', color: '#e5e2e7' }).setOrigin(.5, 0);
+    this.text(w / 2, resultY + 68, `PUNTUACIÓN  ${run.score}`, { fontSize: compact ? '14px' : '16px', fontStyle: '500', color: '#e2c8aa' }).setOrigin(.5, 0);
+    const sentPosition = run.globalPosition;
+    if (run.status === 'sent') {
+      const globalMessage = Number.isInteger(sentPosition) && sentPosition <= 10
+        ? `Puesto ${sentPosition} en el ranking global.`
+        : run.globalChecked
+          ? 'Tu resultado se envió y quedó fuera del top 10 mostrado.'
+          : 'Envío confirmado; no pudimos consultar tu posición global.';
+      this.text(w / 2, resultY + 104, globalMessage, {
+        fontSize: '12px', color: '#c3c2d2', align: 'center', wordWrap: { width: w - 48 },
+      }).setOrigin(.5, 0);
+    } else {
+      const nameY = resultY + (short ? 94 : 112);
+      const canEditName = !run.submissionPayload;
+      const submittedName = run.submissionPayload?.name || run.name || 'Anónimo';
+      if (!short && canEditName) {
+        this.text(w / 2, nameY - 23, 'NOMBRE PARA EL RANKING', { fontSize: '10px', color: '#c3c2d2', letterSpacing: 1 }).setOrigin(.5, 0);
+        this.addPlayerNameInput(w / 2 - Math.min(135, (w - 48) / 2), nameY, Math.min(270, w - 48));
+        this.nameInput.value = run.name === 'Anónimo' ? (this.playerName || '') : run.name;
+      } else {
+        this.text(w / 2, nameY, `Nombre: ${submittedName}`, { fontSize: '12px', color: '#c3c2d2' }).setOrigin(.5, 0);
+      }
+      if (run.message) this.text(w / 2, nameY + (short ? 24 : 48), run.message, {
+        fontSize: '11px', color: '#c3c2d2', align: 'center', wordWrap: { width: w - 52 },
+      }).setOrigin(.5, 0);
+      this.narrativeButton(h * (short ? .80 : .76), run.submissionPayload ? 'REINTENTAR ENVÍO' : 'ENVIAR RESULTADO', () => this.sendRun(run.runId), { revealAfter: 120 });
+    }
+    this.menuLink(w * .28, h - 42, 'VER RANKING', () => this.openRanking(), .5);
+    this.menuLink(w * .70, h - 42, 'VOLVER A JUGAR', () => this.startGame(), .5);
+    this.menuLink(w / 2, h - 20, 'VOLVER AL INICIO', () => this.renderIntro(), .5);
+  }
+  async sendRun(runId) {
+    if (this.submittingRuns.has(runId)) return;
+    let run = getRun(runId);
+    if (!run || run.status === 'sent') { this.renderResults(runId); return; }
+    const submissionPayload = run.submissionPayload || {
+      runId: run.runId,
+      name: String(this.playerName || run.name || 'Anónimo').trim().slice(0, 18) || 'Anónimo',
+      elapsedMs: run.elapsedMs,
+      totalMoves: run.totalMoves,
+      score: run.score,
+    };
+    run = updateRun(runId, { name: submissionPayload.name, submissionPayload, status: 'sending', message: null });
+    this.submittingRuns.add(runId);
+    if (this.screen === 'results') this.renderResults(runId);
+    try {
+      const playerId = getStablePlayerId();
+      if (!playerId) throw new Error('PLAYER_ID_NOT_PERSISTED');
+      const response = await submitCompletedRun(submissionPayload, playerId);
+      updateRun(runId, { status: 'sent', message: null, remoteEntryId: response?.entry?.id ?? null });
+      let globalPosition = null;
+      let globalChecked = false;
+      try {
+        const entries = await fetchGlobalEntries();
+        const index = entries.findIndex((entry) => entry.runId === runId);
+        if (index >= 0) globalPosition = index + 1;
+        globalChecked = true;
+      } catch { /* Keep the accepted result even if the follow-up ranking read fails. */ }
+      updateRun(runId, { globalPosition, globalChecked });
+    } catch (error) {
+      const message = !leaderboardConfigured
+        ? 'Ranking global no configurado; tu resultado sigue guardado en este dispositivo.'
+        : 'No se pudo enviar. Tu resultado sigue guardado; puedes reintentar.';
+      updateRun(runId, { status: 'pending', message, lastError: error.message });
+    } finally {
+      this.submittingRuns.delete(runId);
+      if (this.screen === 'results' && this.completedRunId === runId) this.renderResults(runId);
+    }
   }
 }
 

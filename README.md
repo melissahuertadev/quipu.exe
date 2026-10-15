@@ -34,11 +34,13 @@ npm run preview
 - Completa los cinco niveles para llegar al epílogo.
 - Los controles de viento y efectos de sonido están disponibles en el juego; sus preferencias se guardan en el navegador.
 
-## Ranking
+## Ranking global
 
-La versión actual guarda las diez mejores partidas **localmente en el navegador**. No es un ranking global ni sincroniza resultados entre dispositivos. La puntuación es `segundos + (5 × movimientos)`; gana la puntuación menor y los empates se ordenan por menor tiempo.
+El juego está preparado para enviar partidas completas a Talo a través de un proxy serverless. No incluye una cuenta de Talo, un `Internal name` de leaderboard ni el proxy; hasta configurarlos, el juego informa que el ranking global no está disponible. No presenta puntuaciones locales como globales.
 
-Los resultados se guardan en `localStorage` y pueden borrarse desde la pantalla del ranking. Borrar los datos del sitio en el navegador también puede eliminarlos.
+La puntuación es `segundos + (5 × movimientos)`; gana el valor menor. El navegador desempata por menor tiempo entre las entradas globales recibidas. Talo ordena por puntuación, pero no documenta un segundo criterio global de desempate.
+
+Las partidas completas pendientes se conservan en `localStorage` y se pueden reintentar desde resultados o desde la pantalla de ranking. La integración y los pasos de dashboard/proxy están en [docs/talo-leaderboard.md](docs/talo-leaderboard.md). Empieza copiando `.env.example` a `.env.local` cuando tengas la URL del proxy. No pongas claves de Talo en variables `VITE_*`.
 
 ## Estructura del proyecto
 
@@ -46,7 +48,10 @@ Los resultados se guardan en `localStorage` y pueden borrarse desde la pantalla 
 index.html                 Página de entrada
 src/main.js                Escena Phaser, niveles, interacción y progresión
 src/style.css              Estilos de la interfaz
-src/ranking.js             Ranking y puntuación local
+src/ranking.js             Puntuación y partidas completadas pendientes
+src/leaderboard-client.js  Cliente de la API de proxy del ranking
+api/                       Funciones serverless del leaderboard global en Vercel
+server/talo.js             Comunicación servidor a servidor con Talo
 src/audio/audio-manager.js Audio opcional generado mediante Web Audio API
 src/components/             Dibujo del quipu y del paisaje
 src/assets/fonts/           Fuentes locales y licencias
